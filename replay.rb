@@ -78,15 +78,19 @@ start_ts = Time.now.to_i
 (first_ts..last_ts).each do |timestamp|
     requests[timestamp] ||= []
     puts "log time: #{timestamp - first_ts}, real time: #{Time.now.to_i - start_ts}, making #{requests[timestamp].count} requests"
-    requests[timestamp].each do |info|
-        Thread.new do
-            req = Net::HTTP::Get.new(info[:request])
-            resp = Net::HTTP.start(info[:host], 80) do |http|
-                http.request(req);
+    if requests[timestamp].empty?
+        sleep 1
+    else
+        requests[timestamp].each do |info|
+            Thread.new do
+                req = Net::HTTP::Get.new(info[:request])
+                resp = Net::HTTP.start(info[:host], 80) do |http|
+                    http.request(req);
+                end
             end
+            sleep (1.0/requests[timestamp].count)
         end
     end
-    sleep(1)
 end
 
 # wait for threads to finish
