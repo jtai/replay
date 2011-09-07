@@ -32,7 +32,7 @@ if ARGV.empty?
     exit 0
 end
 
-log = ARGV[0]
+logfile = ARGV[0]
 node = (ARGV[1] || 1).to_i
 nodes = (ARGV[2] || 1).to_i
 
@@ -41,56 +41,83 @@ if node > nodes
     exit 0
 end
 
+# open log file; should throw exception on error
+log = File.open(logfile)
+
+first_ts_s = nil
+last_ts_s = nil
 lineno = 0
-
-def parse_timestamp(timestamp)
-    dt = DateTime.strptime(timestamp, '%d/%b/%Y:%H:%M:%S')
-    return Time.mktime(dt.year, dt.month, dt.day, dt.hour, dt.min, dt.sec).to_i
-end
-
-first_ts = nil
-last_ts = nil
-
 requests = {}
+parser_finished = false
 
-# parse access log
-puts "parsing #{log}"
-File.open(log).each do |line|
-    # LogFormat "%{Host}i %{%d/%b/%Y:%H:%M:%S}t %U%q" replay
-    host, timestamp, request = line.split(' ')
+# start log parsing thread
+Thread.new do
+    log.each do |line|
+        # LogFormat "%{Host}i %{%d/%b/%Y:%H:%M:%S}t %U%q" replay
+        host, timestamp, request = line.split(' ')
 
-    timestamp = parse_timestamp(timestamp)
+        first_ts_s = timestamp if first_ts_s.nil?
+        last_ts_s = timestamp # FIXME: log file not perfectly sorted; last line in file may not really be last ts
 
-    first_ts = timestamp if first_ts.nil?
-    last_ts = timestamp
+        if lineno % nodes == node - 1
+            requests[timestamp] ||= []
+            requests[timestamp] << {:host => host, :request => request}
+        end
 
-    if lineno % nodes == node - 1
-        requests[timestamp] ||= []
-        requests[timestamp] << {:host => host, :request => request}
+        lineno += 1
+
+        # if the buffer gets too big, pause for a bit while the HTTP requests thread catches up
+        sleep(0.1) if requests.count >= 100
     end
-
-    lineno += 1
+    parser_finished = true
 end
 
-start_ts = Time.now.to_i
+# wait for the log parsing thread to buffer up a few entries before we start making requests
+(1..100).each do |i|
+    break if requests.count >= 10 or parser_finished
+    sleep(0.1)
+end
 
-# make HTTP requests
-(first_ts..last_ts).each do |timestamp|
-    requests[timestamp] ||= []
-    puts "log time: #{timestamp - first_ts}, real time: #{Time.now.to_i - start_ts}, making #{requests[timestamp].count} requests"
-    if requests[timestamp].empty?
-        sleep 1
-    else
-        requests[timestamp].each do |info|
-            Thread.new do
-                req = Net::HTTP::Get.new(info[:request])
-                resp = Net::HTTP.start(info[:host], 80) do |http|
-                    http.request(req);
-                end
+# if we can't parse the logs at one log second per real second, we won't be able to feed the thread making the HTTP requests
+throw "log parser running too slowly" unless requests.count >= 10 or parser_finished
+
+dt = DateTime.strptime(first_ts_s, '%d/%b/%Y:%H:%M:%S')
+first_ts = Time.mktime(dt.year, dt.month, dt.day, dt.hour, dt.min, dt.sec)
+log_ts = first_ts
+
+start_ts = Time.now
+
+# make http requests
+while true
+    sys_ts = Time.now
+
+    # convert to string
+    log_ts_s = log_ts.strftime('%d/%b/%Y:%H:%M:%S')
+
+    requests_this_second = requests[log_ts_s] || []
+    puts "log time: #{(log_ts - first_ts).to_i}, real time: #{(sys_ts - start_ts).round.to_i}, buffer #{requests.count}, making #{requests_this_second.count} requests"
+    requests_this_second.each do |info|
+        Thread.new do
+            sleep(rand())
+
+            req = Net::HTTP::Get.new(info[:request])
+            resp = Net::HTTP.start(info[:host], 80) do |http|
+                http.request(req);
             end
-            sleep (1.0/requests[timestamp].count)
         end
     end
+
+    # free memory
+    requests.delete(log_ts_s)
+
+    # we just processed the last timestamp in the log; exit
+    break if log_ts_s == last_ts_s
+
+    # otherwise, get ready to process the next second
+    log_ts += 1
+
+    # sleep the remainder of the second so we stay in sync with the log
+    sleep(1 - (Time.now - sys_ts))
 end
 
 # wait for threads to finish
